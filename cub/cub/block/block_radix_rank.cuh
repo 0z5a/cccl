@@ -973,7 +973,8 @@ struct BlockRadixRankMatchEarlyCounts
       return IsDescending ? RADIX_DIGITS - 1 - bin : bin;
     }
 
-    _CCCL_DEVICE _CCCL_FORCEINLINE void ComputeHistogramsWarp(UnsignedBits (&keys)[KeysPerThread])
+    template <typename Keys>
+    _CCCL_DEVICE _CCCL_FORCEINLINE void ComputeHistogramsWarp(Keys& keys)
     {
       // int* warp_offsets = &s.warp_offsets[warp][0];
       int (&warp_histograms)[RADIX_DIGITS][NumParts] = s.warp_histograms[warp];
@@ -1077,8 +1078,9 @@ struct BlockRadixRankMatchEarlyCounts
       }
     }
 
-    _CCCL_DEVICE _CCCL_FORCEINLINE void ComputeRanksItem(
-      UnsignedBits (&keys)[KeysPerThread], int (&ranks)[KeysPerThread], detail::constant_t<WARP_MATCH_ATOMIC_OR>)
+    template <typename Keys>
+    _CCCL_DEVICE _CCCL_FORCEINLINE void
+    ComputeRanksItem(Keys& keys, int (&ranks)[KeysPerThread], detail::constant_t<WARP_MATCH_ATOMIC_OR>)
     {
       // compute key ranks
       ::cuda::std::uint32_t lane_mask    = 1u << lane;
@@ -1113,8 +1115,9 @@ struct BlockRadixRankMatchEarlyCounts
       }
     }
 
-    _CCCL_DEVICE _CCCL_FORCEINLINE void ComputeRanksItem(
-      UnsignedBits (&keys)[KeysPerThread], int (&ranks)[KeysPerThread], detail::constant_t<WARP_MATCH_ANY>)
+    template <typename Keys>
+    _CCCL_DEVICE _CCCL_FORCEINLINE void
+    ComputeRanksItem(Keys& keys, int (&ranks)[KeysPerThread], detail::constant_t<WARP_MATCH_ANY>)
     {
       // compute key ranks
       int* warp_offsets = &s.warp_offsets[warp][0];
@@ -1140,8 +1143,9 @@ struct BlockRadixRankMatchEarlyCounts
       }
     }
 
-    _CCCL_DEVICE _CCCL_FORCEINLINE void RankKeys(
-      UnsignedBits (&keys)[KeysPerThread], int (&ranks)[KeysPerThread], int (&exclusive_digit_prefix)[BINS_PER_THREAD])
+    template <typename Keys>
+    _CCCL_DEVICE _CCCL_FORCEINLINE void
+    RankKeys(Keys& keys, int (&ranks)[KeysPerThread], int (&exclusive_digit_prefix)[BINS_PER_THREAD])
     {
       ComputeHistogramsWarp(keys);
 
@@ -1183,6 +1187,24 @@ struct BlockRadixRankMatchEarlyCounts
     int (&exclusive_digit_prefix)[BINS_PER_THREAD],
     CountsCallback callback)
   {
+    BlockRadixRankMatchInternal<UnsignedBits, KeysPerThread, DigitExtractorT, CountsCallback> internal(
+      temp_storage, digit_extractor, callback);
+    internal.RankKeys(keys, ranks, exclusive_digit_prefix);
+  }
+
+  template <typename KeysView,
+            int KeysPerThread,
+            typename DigitExtractorT,
+            typename CountsCallback,
+            typename = typename KeysView::value_type>
+  _CCCL_DEVICE _CCCL_FORCEINLINE void RankKeys(
+    KeysView& keys,
+    int (&ranks)[KeysPerThread],
+    DigitExtractorT digit_extractor,
+    int (&exclusive_digit_prefix)[BINS_PER_THREAD],
+    CountsCallback callback)
+  {
+    using UnsignedBits = typename KeysView::value_type;
     BlockRadixRankMatchInternal<UnsignedBits, KeysPerThread, DigitExtractorT, CountsCallback> internal(
       temp_storage, digit_extractor, callback);
     internal.RankKeys(keys, ranks, exclusive_digit_prefix);
