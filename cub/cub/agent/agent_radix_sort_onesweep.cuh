@@ -272,16 +272,48 @@ struct AgentRadixSortOnesweep
     }
   }
 
+  template <typename SmallKey>
+  struct PackedKeys
+  {
+    static_assert(sizeof(SmallKey) == 1 || sizeof(SmallKey) == 2);
+    using value_type                     = SmallKey;
+    static constexpr int KEYS_PER_WORD   = 4 / sizeof(SmallKey);
+    static constexpr int KEY_BITS        = 8 * sizeof(SmallKey);
+    static constexpr uint32_t KEY_MASK   = (1u << KEY_BITS) - 1;
+    static constexpr int NUM_WORDS       = (ITEMS_PER_THREAD + KEYS_PER_WORD - 1) / KEYS_PER_WORD;
+    uint32_t words[NUM_WORDS];
+
+    _CCCL_DEVICE _CCCL_FORCEINLINE PackedKeys(SmallKey (&keys)[ITEMS_PER_THREAD])
+    {
+      _CCCL_PRAGMA_UNROLL_FULL()
+      for (int word = 0; word < NUM_WORDS; ++word)
+      {
+        words[word] = 0;
+      }
+      _CCCL_PRAGMA_UNROLL_FULL()
+      for (int item = 0; item < ITEMS_PER_THREAD; ++item)
+      {
+        words[item / KEYS_PER_WORD] |= static_cast<uint32_t>(keys[item]) << ((item % KEYS_PER_WORD) * KEY_BITS);
+      }
+    }
+
+    _CCCL_DEVICE _CCCL_FORCEINLINE SmallKey operator[](int item) const
+    {
+      return static_cast<SmallKey>((words[item / KEYS_PER_WORD] >> ((item % KEYS_PER_WORD) * KEY_BITS)) & KEY_MASK);
+    }
+  };
+
+  template <typename Keys>
   struct CountsCallback
   {
     using AgentT =
       AgentRadixSortOnesweep<AgentRadixSortOnesweepPolicy, IsDescending, KeyT, ValueT, OffsetT, PortionOffsetT, DecomposerT>;
     AgentT& agent;
     int (&bins)[BINS_PER_THREAD];
-    bit_ordered_type (&keys)[ITEMS_PER_THREAD];
+    Keys& keys;
     static constexpr bool EMPTY = false;
     _CCCL_DEVICE _CCCL_FORCEINLINE
-    CountsCallback(AgentT& agent, int (&bins)[BINS_PER_THREAD], bit_ordered_type (&keys)[ITEMS_PER_THREAD])
+    CountsCallback(AgentT& agent, int (&bins)[BINS_PER_THREAD], Keys& keys)
         : agent(agent)
         , bins(bins)
         , keys(keys)
@@ -383,8 +415,7 @@ struct AgentRadixSortOnesweep
    * d_keys_out corresponding to their digit. The values (if also sorting
    * values) assigned to the current thread block are similarly copied from
    * d_values_in to d_values_out. */
-  _CCCL_DEVICE _CCCL_FORCEINLINE void
-  TryShortCircuit(bit_ordered_type (&keys)[ITEMS_PER_THREAD], int (&bins)[BINS_PER_THREAD])
+  _CCCL_DEVICE _CCCL_FORCEINLINE bool CanShortCircuit(int (&bins)[BINS_PER_THREAD])
   {
     // check if any bin can be short-circuited
     bool short_circuit = false;
@@ -397,8 +428,13 @@ struct AgentRadixSortOnesweep
         short_circuit = short_circuit || bins[u] == TILE_ITEMS;
       }
     }
-    short_circuit = __syncthreads_or(short_circuit);
-    if (!short_circuit)
+    return __syncthreads_or(short_circuit);
+  }
+
+  _CCCL_DEVICE _CCCL_FORCEINLINE void
+  TryShortCircuit(bit_ordered_type (&keys)[ITEMS_PER_THREAD], int (&bins)[BINS_PER_THREAD])
+  {
+    if (!CanShortCircuit(bins))
     {
       return;
     }
@@ -466,8 +502,24 @@ struct AgentRadixSortOnesweep
     ThreadExit();
   }
 
-  _CCCL_DEVICE _CCCL_FORCEINLINE void
-  ScatterKeysShared(bit_ordered_type (&keys)[ITEMS_PER_THREAD], int (&ranks)[ITEMS_PER_THREAD])
+  template <typename SmallKey>
+  _CCCL_DEVICE _CCCL_FORCEINLINE void TryShortCircuit(PackedKeys<SmallKey>& packed, int (&bins)[BINS_PER_THREAD])
+  {
+    if (!CanShortCircuit(bins))
+    {
+      return;
+    }
+    SmallKey keys[ITEMS_PER_THREAD];
+    _CCCL_PRAGMA_UNROLL_FULL()
+    for (int item = 0; item < ITEMS_PER_THREAD; ++item)
+    {
+      keys[item] = packed[item];
+    }
+    ShortCircuitCopy(keys, bins);
+  }
+
+  template <typename Keys>
+  _CCCL_DEVICE _CCCL_FORCEINLINE void ScatterKeysShared(Keys& keys, int (&ranks)[ITEMS_PER_THREAD])
   {
     // write to shared memory
     _CCCL_PRAGMA_UNROLL_FULL()
@@ -659,20 +711,15 @@ struct AgentRadixSortOnesweep
     ScatterValuesGlobal(digits);
   }
 
-  _CCCL_DEVICE _CCCL_FORCEINLINE void Process()
+  template <typename Keys>
+  _CCCL_DEVICE _CCCL_FORCEINLINE void ProcessKeys(Keys& keys)
   {
-    // load keys
-    // if warp1 < warp2, all elements of warp1 occur before those of warp2
-    // in the source array
-    bit_ordered_type keys[ITEMS_PER_THREAD];
-    LoadKeys(block_idx * TILE_ITEMS, keys); // NOLINT(bugprone-misplaced-widening-cast)
-
     // rank keys
     int ranks[ITEMS_PER_THREAD];
     int exclusive_digit_prefix[BINS_PER_THREAD];
     int bins[BINS_PER_THREAD];
     BlockRadixRankT(s.rank_temp_storage)
-      .RankKeys(keys, ranks, digit_extractor(), exclusive_digit_prefix, CountsCallback(*this, bins, keys));
+      .RankKeys(keys, ranks, digit_extractor(), exclusive_digit_prefix, CountsCallback<Keys>(*this, bins, keys));
 
     // scatter keys in shared memory
     __syncthreads();
@@ -692,6 +739,27 @@ struct AgentRadixSortOnesweep
     {
       GatherScatterValues(ranks);
     }
+  }
+
+  _CCCL_DEVICE _CCCL_FORCEINLINE void Process()
+  {
+    // Warp-striped loading preserves each thread's logical item order.
+    bit_ordered_type keys[ITEMS_PER_THREAD];
+    LoadKeys(block_idx * TILE_ITEMS, keys); // NOLINT(bugprone-misplaced-widening-cast)
+
+    if constexpr (
+      _CCCL_PTX_ARCH() == 1200 && KEYS_ONLY
+      && (::cuda::std::is_same_v<KeyT, uint8_t> || ::cuda::std::is_same_v<KeyT, int8_t>
+          || ::cuda::std::is_same_v<KeyT, uint16_t> || ::cuda::std::is_same_v<KeyT, int16_t>))
+    {
+      if (full_block)
+      {
+        PackedKeys<bit_ordered_type> packed(keys);
+        ProcessKeys(packed);
+        return;
+      }
+    }
+    ProcessKeys(keys);
   }
 
   _CCCL_DEVICE _CCCL_FORCEINLINE //
